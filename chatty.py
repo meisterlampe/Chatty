@@ -3,6 +3,7 @@
 
 import appdaemon.plugins.hass.hassapi as hass
 import slixmpp
+import slixmpp_omemo
 
 class Chatty(hass.Hass):
     class Command:
@@ -38,6 +39,19 @@ class Chatty(hass.Hass):
         self.xmpp.register_plugin('xep_0004') # Data Forms
         self.xmpp.register_plugin('xep_0060') # PubSub
         self.xmpp.register_plugin('xep_0199') # XMPP Ping
+        self.xmpp.register_plugin('xep_0380') # XMPP Ping
+
+        try:
+            self.xmpp.register_plugin(
+                'xep_0384',
+                {
+                    # 'data_dir': self.args.data_dir,
+                },
+                module=slixmpp_omemo,
+            ) # OMEMO
+        except (slixmpp_omemo.PluginCouldNotLoad,):
+            self.log.exception('And error occured when loading the omemo plugin.')
+            self.sys.exit(1)
 
         self.xmpp.connect()
         #xmpp.process()   ## we are already async        
@@ -146,17 +160,38 @@ class XMPPconnector(slixmpp.ClientXMPP):
         """
 
         if msg['type'] in ('chat', 'normal'):
-            answer = await self.message_handler.on_incoming_message(msg)
 
-            if answer:
-                try:
-                    msg.reply(answer).send()
-                except slixmpp.xmlstream.xmlstream.NotConnectedError:
-                    self.log("Reply NOT SENT, not connected.")
-                    ## TODO enqueue message for sending after reconnect
-                except:
-                    self.log("Reply NOT SENT, due to unexpected error!")
+            if self['xep_0384'].is_encrypted(msg):
+                await self.on_omemo_message(msg)
+            else:
+                await self.on_unencrypted_message(msg)
 
+    async def on_omemo_message(self, msg):
+        """
+        Called to handle incoming omemo encrypted messages
+        """
+        try:
+            msg.reply("Right now, I cannot decrypt this shit!").send()
+        except slixmpp.xmlstream.xmlstream.NotConnectedError:
+            self.log("Reply NOT SENT, not connected.")
+            ## TODO enqueue message for sending after reconnect
+        except:
+            self.log("Reply NOT SENT, due to unexpected error!")
+
+    async def on_unencrypted_message(self, msg):
+        """
+        Called to handle incoming unencrypted messages
+        """
+        answer = await self.message_handler.on_incoming_message(msg)
+
+        if answer:
+            try:
+                msg.reply(answer).send()
+            except slixmpp.xmlstream.xmlstream.NotConnectedError:
+                self.log("Reply NOT SENT, not connected.")
+                ## TODO enqueue message for sending after reconnect
+            except:
+                self.log("Reply NOT SENT, due to unexpected error!")
 
 class MyCommands:
     def __init__(self, chatty):
