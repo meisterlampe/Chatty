@@ -76,23 +76,21 @@ class Chatty(hass.Hass):
             self.log("Sending '{}' to '{}'".format(message, recipient))
             self.xmpp.send_message_to(recipient, message)
 
-    async def on_incoming_message(self, msg):
-        message = msg["body"]
-        sender = msg["from"]
-        self.log("Incoming: '{}', from '{}".format(message, sender))
+    async def on_incoming_message(self, msgBody, sender):
+        self.log("Incoming: '{}', from '{}".format(msgBody, sender))
 
         # all commands are case insensitive
-        message = message.lower()
+        msgBody = msgBody.lower()
 
         # find command, triggered by the incoming message, and run it
         command = Chatty.Command("", None)
         for x in self.commands:
-            if message.startswith(x.name) and len(x.name) > len(command.name):
+            if msgBody.startswith(x.name) and len(x.name) > len(command.name):
                 command = x
 
         if command.name != "":
             self.log("Running command: {}".format(command.name))
-            return await command.callback(message)
+            return await command.callback(msgBody)
         else:
             self.log("Command not found.")
             return "Sorry, but... what?"
@@ -114,6 +112,8 @@ class Chatty(hass.Hass):
 
     
 class XMPPconnector(slixmpp.ClientXMPP):
+    eme_ns = 'eu.siacs.conversations.axolotl'
+
     def __init__(self, jid, password, message_handler):
         slixmpp.ClientXMPP.__init__(self, jid, password)
         self.message_handler = message_handler
@@ -174,9 +174,10 @@ class XMPPconnector(slixmpp.ClientXMPP):
             allow_untrusted = True
             sender = msg['from']
             encrypted_msg = msg['omemo_encrypted']
-            self.log(encrypted_msg)
-            body = self['xep_0384'].decrypt_message(encrypted_msg, sender, allow_untrusted)
-            await self.encrypted_reply(msg, 'Thanks for sending\n%s' % body.decode("utf8"))
+            body = self['xep_0384'].decrypt_message(encrypted_msg, sender, allow_untrusted).decode("utf8")
+            answer = await self.message_handler.on_incoming_message(body, sender)
+            if answer:
+                await self.encrypted_reply(msg, answer)
             return None
         except (slixmpp_omemo.MissingOwnKey,):
             # The message is missing our own key, it was not encrypted for
@@ -226,7 +227,7 @@ class XMPPconnector(slixmpp.ClientXMPP):
         """
         Called to handle incoming unencrypted messages
         """
-        answer = await self.message_handler.on_incoming_message(msg)
+        answer = await self.message_handler.on_incoming_message(msg["body"], msg["from"])
 
         if answer:
             try:
@@ -241,13 +242,75 @@ class XMPPconnector(slixmpp.ClientXMPP):
         """
         Encrypts the given message and sends it
         """
-        try:
-            original_msg.reply("Sending encrypted not implemented yet").send()
-        except slixmpp.xmlstream.xmlstream.NotConnectedError:
-            self.log("Reply NOT SENT, not connected.")
-            ## TODO enqueue message for sending after reconnect
-        except:
-            self.log("Reply NOT SENT, due to unexpected error!")
+        recipient = original_msg['from']
+        msgType = original_msg['type']
+        msg = self.make_message(mto=recipient, mtype=msgType)
+        msg['eme']['namespace'] = self.eme_ns
+        msg['eme']['name'] = self['xep_0380'].mechanisms[self.eme_ns]
+
+        expect_problems = {}  # type: Optional[Dict[JID, List[int]]]
+
+        while True:
+            try:
+                # `encrypt_message` excepts the plaintext to be sent, a list of
+                # bare JIDs to encrypt to, and optionally a dict of problems to
+                # expect per bare JID.
+                #
+                # Note that this function returns an `<encrypted/>` object,
+                # and not a full Message stanza. This combined with the
+                # `recipients` parameter that requires for a list of JIDs,
+                # allows you to encrypt for 1:1 as well as groupchats (MUC).
+                #
+                # `expect_problems`: See EncryptionPrepareException handling.
+                recipients = [recipient]
+                encrypt = await self['xep_0384'].encrypt_message(msg_to_send, recipients, expect_problems)
+                msg.append(encrypt)
+                return msg.send()
+            except slixmpp_omemo.UndecidedException as exn:
+                # The library prevents us from sending a message to an
+                # untrusted/undecided barejid, so we need to make a decision here.
+                # This is where you prompt your user to ask what to do. In
+                # this bot we will automatically trust undecided recipients.
+                self['xep_0384'].trust(exn.bare_jid, exn.device, exn.ik)
+            # TODO: catch NoEligibleDevicesException
+            except slixmpp_omemo.EncryptionPrepareException as exn:
+                # This exception is being raised when the library has tried
+                # all it could and doesn't know what to do anymore. It
+                # contains a list of exceptions that the user must resolve, or
+                # explicitely ignore via `expect_problems`.
+                # TODO: We might need to bail out here if errors are the same?
+                for error in exn.errors:
+                    if isinstance(error, slixmpp_omemo.MissingBundleException):
+                        # We choose to ignore MissingBundleException. It seems
+                        # to be somewhat accepted that it's better not to
+                        # encrypt for a device if it has problems and encrypt
+                        # for the rest, rather than error out. The "faulty"
+                        # device won't be able to decrypt and should display a
+                        # generic message. The receiving end-user at this
+                        # point can bring up the issue if it happens.
+                        self.plain_reply(
+                            original_msg,
+                            'Could not find keys for device "%d" of recipient "%s". Skipping.' %
+                            (error.device, error.bare_jid),
+                        )
+                        jid = slixmpp.JID(error.bare_jid)
+                        device_list = expect_problems.setdefault(jid, [])
+                        device_list.append(error.device)
+            except (slixmpp.exceptions.IqError, slixmpp.exceptions.IqTimeout) as exn:
+                self.plain_reply(
+                    original_msg,
+                    'An error occured while fetching information on a recipient.\n%r' % exn,
+                )
+                return None
+            except Exception as exn:
+                await self.plain_reply(
+                    original_msg,
+                    'An error occured while attempting to encrypt.\n%r' % exn,
+                )
+                raise
+
+        return None
+
 
 class MyCommands:
     def __init__(self, chatty):
