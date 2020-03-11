@@ -45,7 +45,7 @@ class Chatty(hass.Hass):
             self.xmpp.register_plugin(
                 'xep_0384',
                 {
-                    # 'data_dir': self.args.data_dir,
+                    'data_dir': "/conf/apps/chatty",
                 },
                 module=slixmpp_omemo,
             ) # OMEMO
@@ -171,12 +171,56 @@ class XMPPconnector(slixmpp.ClientXMPP):
         Called to handle incoming omemo encrypted messages
         """
         try:
-            msg.reply("Right now, I cannot decrypt this shit!").send()
-        except slixmpp.xmlstream.xmlstream.NotConnectedError:
-            self.log("Reply NOT SENT, not connected.")
-            ## TODO enqueue message for sending after reconnect
-        except:
-            self.log("Reply NOT SENT, due to unexpected error!")
+            allow_untrusted = True
+            sender = msg['from']
+            encrypted_msg = msg['omemo_encrypted']
+            self.log(encrypted_msg)
+            body = self['xep_0384'].decrypt_message(encrypted_msg, sender, allow_untrusted)
+            await self.encrypted_reply(msg, 'Thanks for sending\n%s' % body.decode("utf8"))
+            return None
+        except (slixmpp_omemo.MissingOwnKey,):
+            # The message is missing our own key, it was not encrypted for
+            # us, and we can't decrypt it.
+            msg.reply('I can\'t decrypt this message as it is not encrypted for me.').send()
+            return None
+        except (slixmpp_omemo.NoAvailableSession,) as exn:
+            # We received a message from that contained a session that we
+            # don't know about (deleted session storage, etc.). We can't
+            # decrypt the message, and it's going to be lost.
+            # Here, as we need to initiate a new encrypted session, it is
+            # best if we send an encrypted message directly. XXX: Is it
+            # where we talk about self-healing messages?
+            await self.encrypted_reply(
+                msg,
+                'I can\'t decrypt this message as it uses an encrypted '
+                'session I don\'t know about.',
+            )
+            return None
+        # except (slixmpp_omemo.UndecidedException, slixmpp_omemo.UntrustedException) as exn:
+        #     # We received a message from an untrusted device. We can
+        #     # choose to decrypt the message nonetheless, with the
+        #     # `allow_untrusted` flag on the `decrypt_message` call, which
+        #     # we will do here. This is only possible for decryption,
+        #     # encryption will require us to decide if we trust the device
+        #     # or not. Clients _should_ indicate that the message was not
+        #     # trusted, or in undecided state, if they decide to decrypt it
+        #     # anyway.
+        #     await msg.reply("Your device '%s' is not in my trusted devices." % exn.device).send()
+            
+        #     # We resend, setting the `allow_untrusted` parameter to True.
+        #     await self.on_omemo_message(msg, allow_untrusted=True)
+        #     return None
+        except (slixmpp_omemo.EncryptionPrepareException,):
+            # Slixmpp tried its best, but there were errors it couldn't
+            # resolve. At this point you should have seen other exceptions
+            # and given a chance to resolve them already.
+            msg.reply('I was not able to decrypt the message.').send()
+            return None
+        except (Exception,) as exn:
+            msg.reply('An error occured while attempting decryption.\n%r' % exn).send()
+            raise
+
+        return None
 
     async def on_unencrypted_message(self, msg):
         """
@@ -193,6 +237,18 @@ class XMPPconnector(slixmpp.ClientXMPP):
             except:
                 self.log("Reply NOT SENT, due to unexpected error!")
 
+    async def encrypted_reply(self, original_msg, msg_to_send):
+        """
+        Encrypts the given message and sends it
+        """
+        try:
+            original_msg.reply("Sending encrypted not implemented yet").send()
+        except slixmpp.xmlstream.xmlstream.NotConnectedError:
+            self.log("Reply NOT SENT, not connected.")
+            ## TODO enqueue message for sending after reconnect
+        except:
+            self.log("Reply NOT SENT, due to unexpected error!")
+
 class MyCommands:
     def __init__(self, chatty):
         """
@@ -204,4 +260,3 @@ class MyCommands:
 
     async def help(self, message):
         return "I'm alive. But I can't really do anything, yet."
-
